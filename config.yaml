@@ -1,0 +1,69 @@
+metadata:
+  service_date: '2026-03-01'
+  church: New Creation Church
+  title: ''
+  livestream: ''            # auto-refreshed each run with the latest scraped URL
+  override_livestream: ''   # set manually to force a specific URL (skips scraping)
+timezone: Asia/Singapore    # service-local tz used to decide which service has started
+download:
+  min_healthy_mb: 400       # a download/trim smaller than this is treated as corrupt
+api:
+  telegram: ''
+  youtube: ''
+# urls: moved to config.local.yaml (git-ignored) so the deployment's channel
+#   URLs are not committed. Copy config.local.example.yaml -> config.local.yaml.
+#   Values there override this file on read and are never written back.
+logging:
+  directory: logs
+  filename: '{date}_pipeline.log'
+  level: DEBUG
+path:
+  archived: archived
+  downloaded: downloaded
+  trimmed: trimmed
+naming:
+  similarity_output: similarity_{date}.txt
+  trimmed_video: '{date}_sermon.mp4'
+  trimmed_audio: '{date}_sermon.mp3'
+audio:
+  sample_rate: 48000
+  quiet_level: -50
+  loud_level: -20
+asr:
+  enabled: true                 # self-hosted ASR is the primary trim detector
+  whisper_model: tiny           # faster-whisper size for transcription (tiny|base|small)
+  start_padding: 5              # seconds backed off the detected start (avoid clipping the opening)
+  end_padding: 5                # seconds added past the detected end
+diarization:
+  rate: 1.4
+  confidence_thresholds:        # legacy reference values; no longer gate the trim
+    announcement: 0.8
+    preacher: 0.6
+  self_enroll:                  # build the preacher reference from the audio itself
+    gap_bridge_seconds: 20      # bridge brief pauses/dips when locating the speech run
+    min_run_seconds: 300        # ignore candidate speech runs shorter than this (5 min)
+    refine_keep_ratio: 0.5      # 2nd-pass centroid keeps this top-similarity fraction
+segment_duration: 256
+speakers:
+  Pre_svc:
+    start: 5
+  Worship:
+    start: 30
+  Announcement:
+    start: 50
+  Preacher:
+    start: 70
+trim_logic:
+  smooth_window_seconds: 15     # moving-average window applied before boundary detection
+  high_percentile: 65           # the sermon "core" is the longest plateau above this percentile
+  low_percentile: 40            # the end extends forward while scores stay above this percentile
+  shoulder_ratio: 0.9
+  dominance_margin: 0.0          # start gate: require Preacher >= max(Announcement,Worship)+margin
+  dominance_sustain_seconds: 45  # dominance must hold this long to mark the true sermon start           # start-extension threshold = low + ratio*(high - low)
+  min_continuous_seconds: 10    # minimum length of the high-confidence core
+  core_gap_seconds: 120         # bridge brief dips when locating the core plateau
+  start_gap_seconds: 60         # max dip bridged extending the start back (tight, avoids bleed)
+  end_gap_seconds: 300          # max dip bridged extending the end forward (keeps the closing)
+  start_padding: 15             # seconds backed off the start so the opening is never clipped
+  padding: 8                    # seconds added past the detected end
+  end_must_be_after_ratio: 0.9  # legacy; unused by the plateau logic

@@ -1,0 +1,16 @@
+# Template for config.local.yaml — copy this file to config.local.yaml (which is
+# git-ignored) and fill in your deployment's values.
+#
+#     cp config.local.example.yaml config.local.yaml
+#
+# Anything here overrides config.yaml on read (via Configs.get) and is never
+# written back to config.yaml, so private values stay out of version control.
+urls:
+  jp: https://www.example.com/sermons
+  ncc: https://www.example.com/ncc-sermons
+  youtube: https://www.youtube.com/@YourChannel/featured
+
+# Optional: other private values can live here too, e.g.
+# api:
+#   telegram: your-telegram-token
+#   youtube: your-youtube-key

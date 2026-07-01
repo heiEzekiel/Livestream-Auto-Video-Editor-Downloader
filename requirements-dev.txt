@@ -1,0 +1,2 @@
+# Development / testing dependencies (not needed on the production runner)
+pytest>=8.0

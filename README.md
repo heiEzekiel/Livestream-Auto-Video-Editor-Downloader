@@ -5,19 +5,28 @@ to retain only the main segment of the video (e.g. trimming away pre-service and
 post-service portions, keeping the core message).
 
 The pipeline scrapes a YouTube channel for the day's livestream, downloads it
-with `yt-dlp`, uses speaker diarization ([Resemblyzer](https://github.com/resemble-ai/Resemblyzer))
-to find where the main speaker starts and stops, and trims the video to that
-range with `ffmpeg`.
+with `yt-dlp`, detects where the main message (sermon) starts and ends, and trims
+the video to that range with `ffmpeg`.
 
-The preacher reference is **self-enrolled from the audio itself** (the longest
-continuous speech run, located via loudness banding) rather than guessed from
-fixed clock offsets. The sermon is then found as the long high-confidence
-**plateau** in the preacher similarity: the trim anchors on that plateau and
-extends its two ends **asymmetrically** — tightly at the start (so it never
-bleeds back into announcements/worship) and forgivingly at the end (so it keeps
-the closing/altar-call that follows a quiet stretch). All thresholds are
-per-service percentiles, so the trim self-calibrates instead of depending on a
-service running to a fixed schedule.
+Boundary detection is **self-hosted** — no audio or transcript leaves the machine
+and there is no cloud API or per-call cost, so it runs unattended on a Raspberry
+Pi. The **primary** detector transcribes the audio with
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) and then finds the
+sermon with a hybrid content detector: a fast, deterministic heuristic
+(handoff-phrase + scripture/announcement lexical scoring) that defers to a small
+**local LLM** only for the low-confidence boundaries. See
+[Self-hosted ASR (local LLM)](#self-hosted-asr-local-llm) below.
+
+The **fallback** detector uses speaker diarization
+([Resemblyzer](https://github.com/resemble-ai/Resemblyzer)): the preacher
+reference is *self-enrolled from the audio itself* (the longest continuous speech
+run, located via loudness banding) rather than guessed from fixed clock offsets,
+and the sermon is found as the long high-confidence **plateau** in the preacher
+similarity — anchored on that plateau and extended **asymmetrically**, tightly at
+the start (so it never bleeds back into announcements/worship) and forgivingly at
+the end (so it keeps the closing/altar-call that follows a quiet stretch). All
+thresholds are per-service percentiles, so the trim self-calibrates instead of
+depending on a service running to a fixed schedule.
 
 ---
 
@@ -26,16 +35,16 @@ service running to a fixed schedule.
 The pipeline is orchestrated by [`run.sh`](run.sh) and runs in stages:
 
 ```text
-run.sh
- ├─ 1. checker.py      → already downloaded today? (prints TRUE/FALSE)
- ├─ 2. pre-setup.py    → find today's livestream URL (prints URL)
- ├─ 3. yt-dlp          → download the livestream
- └─ 4. process_vid.py  → convert → diarize → detect trim points → trim (prints TRUE/FALSE)
+run.sh  (single-instance flock lock — overlapping cron runs exit instead of clobbering)
+ ├─ 1. checker.py      → already done / resume / fresh? (prints TRUE / PROCESS / DOWNLOAD)
+ ├─ 2. pre-setup.py    → resolve today's livestream URL (prints URL)
+ ├─ 3. yt-dlp          → download the livestream from the start
+ └─ 4. process_vid.py  → convert → transcribe → detect sermon span → trim (prints TRUE/FALSE)
 ```
 
 | Stage | Script | Responsibility |
 |-------|--------|----------------|
-| **Checker** | [`checker.py`](checker.py) | Guards against re-processing. Validates that today's files exist and look healthy (size threshold, trimmed file is meaningfully smaller than the source, only one source `.mp4`). Cleans up and reports `FALSE` so the pipeline can re-run if anything looks corrupt. |
+| **Checker** | [`checker.py`](checker.py) | Decides the pipeline state and prints one of `TRUE` (already downloaded **and** trimmed — nothing to do), `PROCESS` (healthy download exists but no/corrupt trim — resume at processing **without re-downloading**), or `DOWNLOAD` (no usable download — fetch fresh). Only genuinely corrupt/incomplete artifacts are deleted; a healthy download is never removed just because the trim is missing, so an interrupted run resumes safely. |
 | **Pre-setup** | [`pre-setup.py`](pre-setup.py) | Confirms today is a Sunday, creates the dated working folders, then scrapes the configured YouTube channel ([`VideoUtils.get_upcoming_streams`](video_utils.py)) for the day's livestream and stores the title/URL in `config.yaml`. |
 | **Download** | `yt-dlp` (in `run.sh`) | Downloads the livestream from the start, waiting for it to go live if necessary. |
 | **Process** | [`process_vid.py`](process_vid.py) | Renames/moves the download into `downloaded/<date>/`, extracts audio to MP3, then detects the sermon span and trims to `trimmed/<date>/`. **Primary:** self-hosted ASR — transcribe with faster-whisper, then a hybrid heuristic + local-LLM detector ([`asr_local.detect`](asr_local.py), no cloud API). **Fallback:** speaker-diarization similarity plateau ([`AudioUtils.get_trim_range`](audio_utils.py)) if ASR is disabled, errors, or returns an invalid span. Toggle via `asr.enabled` in `config.yaml`. |
@@ -45,6 +54,9 @@ run.sh
 - [`configs.py`](configs.py) — typed access to `config.yaml` (dot-notation `get`/`update`, plus convenience properties).
 - [`audio_utils.py`](audio_utils.py) — audio loading, loudness analysis, MP3 conversion, speaker-segment generation, diarization, and trim detection.
 - [`video_utils.py`](video_utils.py) — YouTube channel scraping and `ffmpeg` trimming.
+- [`asr_transcribe.py`](asr_transcribe.py) — faster-whisper transcription into a cached JSONL transcript.
+- [`asr_local.py`](asr_local.py) — the hybrid sermon detector (heuristic + local-LLM fallback).
+- [`asr_llm.py`](asr_llm.py) — the local LLM (`llama-cpp-python`) that refines low-confidence boundaries.
 - [`utils.py`](utils.py) — file/date/size helpers shared across stages.
 - [`logger.py`](logger.py) — console + file logging (`sermon_pipeline` logger).
 - [`resource_monitor.py`](resource_monitor.py) — samples RAM (pipeline + system-wide), CPU, and (on the Pi) SoC temperature/throttling around the heavy stages; warns on low free memory or high temperature.
@@ -93,7 +105,9 @@ pip install -r requirements-dev.txt
 ```
 
 `run.sh` will create the virtual environment and install dependencies for you on
-first run, and update `yt-dlp` on subsequent runs.
+first run, and update `yt-dlp` on subsequent runs. On first run it also downloads
+the local ASR model (~1.9 GB) to `models/`; set `SKIP_LLM=1` to skip the LLM and
+run the heuristic-only detector. See [Self-hosted ASR (local LLM)](#self-hosted-asr-local-llm).
 
 ---
 
@@ -109,8 +123,7 @@ metadata:
   livestream: ''               # auto-refreshed each run with the latest scraped URL
   override_livestream: ''      # set manually to force a specific URL (skips scraping)
 
-urls:
-  youtube: https://www.youtube.com/<channel-id>/featured
+# urls (channel URLs) live in config.local.yaml — see "Private config" below.
 
 logging:
   directory: logs
@@ -130,6 +143,12 @@ naming:
 audio:
   sample_rate: 48000
   loud_level: -20              # dBFS threshold used to locate the loud (worship) section
+
+asr:                           # self-hosted ASR (primary detector) — see "Self-hosted ASR" below
+  enabled: true                # false → skip ASR, use diarization only
+  whisper_model: tiny          # faster-whisper size (tiny | base | small)
+  start_padding: 5             # seconds backed off the detected start
+  end_padding: 5               # seconds added past the detected end
 
 diarization:
   rate: 1.4                    # Resemblyzer embedding rate
@@ -168,12 +187,87 @@ trim_logic:
 > **Note:** `config.yaml` currently doubles as runtime state — `service_date`,
 > `title`, and `livestream` are written back to it on each run.
 
+### Private config (`config.local.yaml`)
+
+Deployment-specific and private values — the channel URLs, and optionally API
+keys — live in `config.local.yaml`, which is **git-ignored** so they are never
+committed. Values there are merged over `config.yaml` on read (the overlay wins)
+and are never written back. Copy the template and fill it in:
+
+```bash
+cp config.local.example.yaml config.local.yaml
+```
+
+```yaml
+# config.local.yaml
+urls:
+  yyy:     https://www.example.com/yyy
+  yyy:     https://www.example.com/yyy
+  youtube: https://www.youtube.com/@YourChannel/featured
+```
+
 ### Credentials
 
 Credentials are kept out of version control (`credentials/` is git-ignored):
 
 - `credentials/yt.json` — Google OAuth client secrets for YouTube upload (used by [`youtube.py`](youtube.py)).
 - Telegram bot token — read by [`telegram.py`](telegram.py) (optional notifier).
+
+---
+
+## Self-hosted ASR (local LLM)
+
+Sermon-boundary detection is the **primary** trim method and runs entirely
+on-device — no audio or transcript ever leaves the machine, and there is no cloud
+API or per-call cost. It has two stages:
+
+1. **Transcription** — [`asr_transcribe.py`](asr_transcribe.py) transcribes the
+   service audio with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+   (CTranslate2, int8, greedy decode) and caches the result as a JSONL transcript
+   under `transcripts/`, so re-runs are free.
+2. **Detection** — [`asr_local.py`](asr_local.py) finds the sermon span with a
+   hybrid detector:
+   - a fast, deterministic **heuristic** (`heuristic_detect`) scores each segment
+     for handoff phrases ("welcome Pastor …", "the preaching of the word") and
+     sermon-vs-announcement vocabulary, returning boundaries **with a confidence**;
+   - for any **low-confidence** boundary (e.g. a service with no spoken handoff),
+     it defers to a small **local LLM** ([`asr_llm.py`](asr_llm.py) — Qwen2.5-3B
+     Instruct, `Q4_K_M` GGUF via `llama-cpp-python`). To keep it cheap on a Pi the
+     model is sent **only a short window centered on the uncertain boundary**; the
+     confident boundary stays the heuristic anchor and is never sent.
+
+If ASR is disabled (`asr.enabled: false`), errors, or returns an invalid span,
+the pipeline automatically falls back to the diarization detector.
+
+### The local model
+
+`run.sh` downloads the GGUF model once to `models/` (git-ignored, ~1.9 GB) on the
+first run. The download is **non-fatal**: if it fails, the pipeline still runs the
+heuristic-only path. faster-whisper downloads its own (small) model automatically
+on first transcription.
+
+`llama-cpp-python` has no prebuilt aarch64 wheel, so it **compiles** on the Pi
+during `pip install`. Install the build tools once (see [`pi_test.sh`](pi_test.sh)):
+
+```bash
+sudo apt-get install -y build-essential cmake ffmpeg python3-dev
+```
+
+### Tuning (environment variables)
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SKIP_LLM` | `0` | `1` = heuristic-only; the local LLM is never loaded. |
+| `ASR_LLM_MODEL` | `models/Qwen2.5-3B-Instruct-Q4_K_M.gguf` | Path to the GGUF model. |
+| `ASR_REFINE_WINDOW_S` | `420` | ± window (seconds) sent to the LLM around an uncertain boundary. |
+| `ASR_LLM_NCTX` | `20480` | LLM context size (KV-cache allocation). |
+| `ASR_LLM_THREADS` | all cores | CPU threads for the LLM (lower it to trade speed for a cooler Pi). |
+
+Transcribe a service by hand (writes a cached JSONL under `transcripts/`):
+
+```bash
+python asr_transcribe.py 2026-03-01 --model tiny
+```
 
 ---
 
@@ -191,17 +285,19 @@ livestream. The script exits early if today's stream was already processed.
 ### Running stages individually
 
 ```bash
-python checker.py        # prints TRUE if today is already done, else FALSE
-python pre-setup.py      # prints the resolved livestream URL
-python process_vid.py    # processes the most recent download, prints TRUE on success
+python checker.py                 # prints TRUE (done) / PROCESS (resume) / DOWNLOAD (fetch)
+python pre-setup.py               # prints the resolved livestream URL
+python asr_transcribe.py <date>   # (optional) pre-transcribe a service to cached JSONL
+python process_vid.py             # processes the most recent download, prints TRUE on success
 ```
 
 ### Output layout
 
 ```text
-downloaded/<date>/   # raw download + extracted MP3 + similarity_<date>.txt
+downloaded/<date>/   # raw download + extracted MP3 + transcript (.jsonl) + similarity_<date>.txt
 trimmed/<date>/      # <date>_sermon.mp4  (the auto-edited result)
 archived/<date>/     # archive folder
+transcripts/<date>.jsonl  # cached transcript when using asr_transcribe.py directly
 logs/<date>_pipeline.log
 ```
 
@@ -224,19 +320,24 @@ python -m pytest          # or: python -m pytest -v
 
 ```text
 .
-├── run.sh                # pipeline orchestrator (Linux)
-├── checker.py            # stage 1: already-downloaded guard
-├── pre-setup.py          # stage 2: resolve livestream URL
-├── process_vid.py        # stage 4: convert, diarize, trim
-├── config.yaml           # configuration + runtime state
-├── configs.py            # config accessor
-├── audio_utils.py        # audio + diarization + trim detection
-├── video_utils.py        # YouTube scraping + ffmpeg trimming
-├── utils.py              # shared file/date/size helpers
-├── logger.py             # logging setup
-├── youtube.py            # optional: YouTube upload helper
-├── telegram.py           # optional: Telegram notifier
-├── tests/                # pytest suite
-├── requirements.txt      # runtime dependencies
-└── requirements-dev.txt  # test dependencies
+├── run.sh                     # pipeline orchestrator (Linux, single-instance lock)
+├── checker.py                 # stage 1: 3-state guard (TRUE/PROCESS/DOWNLOAD)
+├── pre-setup.py               # stage 2: resolve livestream URL
+├── process_vid.py             # stage 4: convert, detect sermon span, trim
+├── asr_transcribe.py          # ASR: faster-whisper transcription (cached JSONL)
+├── asr_local.py               # ASR: hybrid heuristic + local-LLM detector
+├── asr_llm.py                 # ASR: local LLM boundary refinement (llama-cpp)
+├── audio_utils.py             # fallback: audio + diarization + trim detection
+├── video_utils.py             # YouTube scraping + ffmpeg trimming
+├── resource_monitor.py        # RAM/CPU/temp monitoring around heavy stages
+├── utils.py                   # shared file/date/size helpers
+├── logger.py                  # logging setup
+├── configs.py                 # config accessor (config.yaml + config.local.yaml overlay)
+├── config.yaml                # configuration + runtime state
+├── config.local.example.yaml  # template for the git-ignored private overlay
+├── youtube.py                 # optional: YouTube upload helper
+├── telegram.py                # optional: Telegram notifier
+├── tests/                     # pytest suite
+├── requirements.txt           # runtime dependencies
+└── requirements-dev.txt       # test dependencies
 ```
